@@ -84,7 +84,7 @@ class _RequestRideScreenState extends State<RequestRideScreen> {
     if (_dropoff == null) return;
     setState(() => _busy = true);
     try {
-      final ride = context.read<RideService>().requestRide(
+      final ride = await context.read<RideService>().requestRide(
             passenger: widget.passenger,
             pickup: _pickup,
             pickupLabel: _pickupLabel,

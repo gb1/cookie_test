@@ -1,38 +1,104 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:latlong2/latlong.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:uuid/uuid.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../models/app_user.dart';
 import '../models/ride.dart';
 import '../util/cork_harbour.dart';
+import 'auth_service.dart';
 
-/// In-memory matchmaker for rides. Both passenger and driver UIs read from
-/// the same instance (provided at the top of the widget tree), so creating a
-/// ride in one tab/screen makes it visible to the other.
+/// Postgres-backed ride matchmaker. Holds a local cache of rides hydrated
+/// from `public.rides` plus a realtime subscription so passenger and driver
+/// UIs (in different browsers / on different devices) update each other.
 class RideService extends ChangeNotifier {
-  RideService(this._prefs) {
-    _restoreHistory();
+  RideService({required SupabaseClient client, required AuthService auth})
+      : _client = client,
+        _auth = auth {
+    _auth.addListener(_onAuthChanged);
+    _onAuthChanged();
   }
 
-  static const _kHistory = 'rides.history';
+  final SupabaseClient _client;
+  final AuthService _auth;
 
-  final SharedPreferences _prefs;
-  final _uuid = const Uuid();
+  // Cache, keyed by ride id, hydrated from realtime + initial fetch.
+  final Map<String, Ride> _rides = <String, Ride>{};
 
+  RealtimeChannel? _ridesChannel;
+  RealtimeChannel? _profilesChannel;
+
+  // Online drivers, keyed by id, sourced from profiles.is_online_driver.
   final Map<String, AppUser> _onlineDrivers = <String, AppUser>{};
-  final List<Ride> _pending = <Ride>[];
-  final List<Ride> _active = <Ride>[];
-  final List<Ride> _history = <Ride>[];
+
+  String? _currentUserId;
+
+  // ─── public API (matches the previous in-memory service) ────────────
 
   List<AppUser> get onlineDrivers => List.unmodifiable(_onlineDrivers.values);
-  List<Ride> get pendingRequests => List.unmodifiable(_pending);
-  List<Ride> get activeRides => List.unmodifiable(_active);
-  List<Ride> get history => List.unmodifiable(_history);
 
-  // ─── driver presence ────────────────────────────────────────────────
+  List<Ride> get pendingRequests => _rides.values
+      .where((r) => r.status == RideStatus.requested)
+      .toList()
+    ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
 
-  void setDriverOnline(AppUser driver, {bool online = true}) {
+  List<Ride> get activeRides => _rides.values
+      .where((r) =>
+          r.status != RideStatus.requested && !r.status.isTerminal)
+      .toList();
+
+  List<Ride> get history => _rides.values
+      .where((r) => r.status.isTerminal)
+      .toList()
+    ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+
+  bool isDriverOnline(String driverId) =>
+      _onlineDrivers.containsKey(driverId);
+
+  Ride? rideById(String id) => _rides[id];
+
+  Ride? activeFor(String userId) {
+    for (final r in _rides.values) {
+      if (r.involves(userId) &&
+          r.status != RideStatus.requested &&
+          !r.status.isTerminal) {
+        return r;
+      }
+    }
+    return null;
+  }
+
+  Ride? pendingFor(String passengerId) {
+    for (final r in _rides.values) {
+      if (r.passengerId == passengerId &&
+          r.status == RideStatus.requested) {
+        return r;
+      }
+    }
+    return null;
+  }
+
+  List<Ride> historyFor(String userId) =>
+      _rides.values
+          .where((r) => r.involves(userId) && r.status.isTerminal)
+          .toList()
+        ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+
+  List<Ride> pendingForDriver(AppUser driver) =>
+      _rides.values
+          .where((r) =>
+              r.status == RideStatus.requested &&
+              CorkHarbour.contains(r.pickup))
+          .toList()
+        ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+
+  // ─── lifecycle commands ─────────────────────────────────────────────
+
+  Future<void> setDriverOnline(AppUser driver, {bool online = true}) async {
+    await _client
+        .from('profiles')
+        .update({'is_online_driver': online}).eq('id', driver.id);
     if (online) {
       _onlineDrivers[driver.id] = driver;
     } else {
@@ -41,59 +107,13 @@ class RideService extends ChangeNotifier {
     notifyListeners();
   }
 
-  bool isDriverOnline(String driverId) =>
-      _onlineDrivers.containsKey(driverId);
-
-  // ─── lookups ────────────────────────────────────────────────────────
-
-  Ride? activeFor(String userId) {
-    for (final r in _active) {
-      if (r.involves(userId)) return r;
-    }
-    return null;
-  }
-
-  Ride? pendingFor(String passengerId) {
-    for (final r in _pending) {
-      if (r.passengerId == passengerId) return r;
-    }
-    return null;
-  }
-
-  Ride? rideById(String id) {
-    for (final r in _pending) {
-      if (r.id == id) return r;
-    }
-    for (final r in _active) {
-      if (r.id == id) return r;
-    }
-    for (final r in _history) {
-      if (r.id == id) return r;
-    }
-    return null;
-  }
-
-  List<Ride> historyFor(String userId) =>
-      _history.where((r) => r.involves(userId)).toList()
-        ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
-
-  /// Pending rides a driver could accept. Limited to those with a pickup
-  /// inside the harbour bounds (already enforced on creation, but kept here
-  /// as a safety net).
-  List<Ride> pendingForDriver(AppUser driver) {
-    return _pending.where((r) => CorkHarbour.contains(r.pickup)).toList()
-      ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
-  }
-
-  // ─── lifecycle ──────────────────────────────────────────────────────
-
-  Ride requestRide({
+  Future<Ride> requestRide({
     required AppUser passenger,
     required LatLng pickup,
     required String pickupLabel,
     required LatLng dropoff,
     required String dropoffLabel,
-  }) {
+  }) async {
     if (!CorkHarbour.contains(pickup) || !CorkHarbour.contains(dropoff)) {
       throw const RideException('Both points must be inside Cork Harbour.');
     }
@@ -105,121 +125,261 @@ class RideService extends ChangeNotifier {
     final eta = CorkHarbour.estimatedDuration(pickup, dropoff);
     final fare = CorkHarbour.estimateFare(pickup, dropoff);
 
-    final ride = Ride(
-      id: _uuid.v4(),
-      passengerId: passenger.id,
-      passengerName: passenger.name,
-      pickup: pickup,
-      pickupLabel: pickupLabel,
-      dropoff: dropoff,
-      dropoffLabel: dropoffLabel,
-      distanceKm: km,
-      etaMinutes: eta.inMinutes,
-      fareEur: fare,
-    );
-    _pending.add(ride);
+    final inserted = await _client
+        .from('rides')
+        .insert({
+          'passenger_id': passenger.id,
+          'passenger_name': passenger.name,
+          'pickup_lat': pickup.latitude,
+          'pickup_lng': pickup.longitude,
+          'pickup_label': pickupLabel,
+          'dropoff_lat': dropoff.latitude,
+          'dropoff_lng': dropoff.longitude,
+          'dropoff_label': dropoffLabel,
+          'distance_km': km,
+          'eta_minutes': eta.inMinutes,
+          'fare_eur': fare,
+          'status': 'requested',
+        })
+        .select()
+        .single();
+
+    final ride = _rideFromRow(inserted);
+    _rides[ride.id] = ride;
     notifyListeners();
     return ride;
   }
 
-  Ride acceptRide(String rideId, AppUser driver) {
-    final idx = _pending.indexWhere((r) => r.id == rideId);
-    if (idx == -1) {
-      throw const RideException('That ride is no longer available.');
-    }
+  Future<Ride> acceptRide(String rideId, AppUser driver) async {
     if (activeFor(driver.id) != null) {
       throw const RideException('You already have an active trip.');
     }
-    final ride = _pending.removeAt(idx);
-    ride.driverId = driver.id;
-    ride.driverName = driver.name;
-    ride.vesselName = driver.vesselName;
-    ride.status = RideStatus.accepted;
-    _active.add(ride);
+    final updated = await _client
+        .from('rides')
+        .update({
+          'driver_id': driver.id,
+          'driver_name': driver.name,
+          'vessel_name': driver.vesselName,
+          'status': 'accepted',
+        })
+        .eq('id', rideId)
+        .eq('status', 'requested')
+        .select()
+        .maybeSingle();
+    if (updated == null) {
+      throw const RideException('That ride is no longer available.');
+    }
+    final ride = _rideFromRow(updated);
+    _rides[ride.id] = ride;
     notifyListeners();
     return ride;
   }
 
-  void advanceRide(String rideId, RideStatus next) {
-    final ride = _findActive(rideId);
-    if (!_isValidTransition(ride.status, next)) {
-      throw RideException('Cannot move ride from ${ride.status.name} '
+  Future<void> advanceRide(String rideId, RideStatus next) async {
+    final current = _rides[rideId];
+    if (current == null) {
+      throw const RideException('Ride not found.');
+    }
+    if (!isValidRideTransition(current.status, next)) {
+      throw RideException('Cannot move ride from ${current.status.name} '
           'to ${next.name}.');
     }
-    ride.status = next;
+    final patch = <String, dynamic>{'status': next.name};
     if (next == RideStatus.completed) {
-      ride.completedAt = DateTime.now();
-      _active.remove(ride);
-      _history.insert(0, ride);
-      _persistHistory();
+      patch['completed_at'] = DateTime.now().toUtc().toIso8601String();
+    }
+    final updated = await _client
+        .from('rides')
+        .update(patch)
+        .eq('id', rideId)
+        .select()
+        .single();
+    _rides[rideId] = _rideFromRow(updated);
+    notifyListeners();
+  }
+
+  Future<void> cancelRide(String rideId, String byUserId) async {
+    final updated = await _client
+        .from('rides')
+        .update({
+          'status': 'cancelled',
+          'cancelled_by_user_id': byUserId,
+          'completed_at': DateTime.now().toUtc().toIso8601String(),
+        })
+        .eq('id', rideId)
+        .select()
+        .single();
+    _rides[rideId] = _rideFromRow(updated);
+    notifyListeners();
+  }
+
+  // ─── realtime + hydration ───────────────────────────────────────────
+
+  void _onAuthChanged() {
+    final user = _auth.currentUser;
+    if (user == null) {
+      _disconnect();
+      return;
+    }
+    if (user.id == _currentUserId) return;
+    _currentUserId = user.id;
+    _connect();
+  }
+
+  Future<void> _connect() async {
+    _disconnect();
+    await _hydrateRides();
+    await _hydrateOnlineDrivers();
+
+    _ridesChannel = _client
+        .channel('public:rides')
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'rides',
+          callback: (payload) {
+            switch (payload.eventType) {
+              case PostgresChangeEvent.insert:
+              case PostgresChangeEvent.update:
+                final row = payload.newRecord;
+                if (row.isNotEmpty) {
+                  _rides[row['id'] as String] = _rideFromRow(row);
+                  notifyListeners();
+                }
+                break;
+              case PostgresChangeEvent.delete:
+                final old = payload.oldRecord;
+                if (old.isNotEmpty) {
+                  _rides.remove(old['id']);
+                  notifyListeners();
+                }
+                break;
+              case PostgresChangeEvent.all:
+                break;
+            }
+          },
+        )
+        .subscribe();
+
+    _profilesChannel = _client
+        .channel('public:profiles')
+        .onPostgresChanges(
+          event: PostgresChangeEvent.update,
+          schema: 'public',
+          table: 'profiles',
+          callback: (payload) {
+            final row = payload.newRecord;
+            if (row.isEmpty) return;
+            final id = row['id'] as String;
+            final isOnline = row['is_online_driver'] as bool? ?? false;
+            final isDriver = row['role'] == 'driver';
+            if (isDriver && isOnline) {
+              _onlineDrivers[id] = AppUser(
+                id: id,
+                email: row['email'] as String? ?? '',
+                name: row['name'] as String? ?? '',
+                role: UserRole.driver,
+                vesselName: row['vessel_name'] as String?,
+                vesselCapacity: row['vessel_capacity'] as int?,
+              );
+            } else {
+              _onlineDrivers.remove(id);
+            }
+            notifyListeners();
+          },
+        )
+        .subscribe();
+  }
+
+  void _disconnect() {
+    if (_ridesChannel != null) {
+      _client.removeChannel(_ridesChannel!);
+      _ridesChannel = null;
+    }
+    if (_profilesChannel != null) {
+      _client.removeChannel(_profilesChannel!);
+      _profilesChannel = null;
+    }
+    _rides.clear();
+    _onlineDrivers.clear();
+    _currentUserId = null;
+    notifyListeners();
+  }
+
+  Future<void> _hydrateRides() async {
+    final rows = await _client
+        .from('rides')
+        .select()
+        .order('created_at', ascending: false)
+        .limit(200);
+    _rides.clear();
+    for (final row in rows) {
+      final r = _rideFromRow(row);
+      _rides[r.id] = r;
     }
     notifyListeners();
   }
 
-  void cancelRide(String rideId, String byUserId) {
-    // Try pending first.
-    final pIdx = _pending.indexWhere((r) => r.id == rideId);
-    if (pIdx != -1) {
-      final ride = _pending.removeAt(pIdx);
-      ride.status = RideStatus.cancelled;
-      ride.cancelledByUserId = byUserId;
-      ride.completedAt = DateTime.now();
-      _history.insert(0, ride);
-      _persistHistory();
-      notifyListeners();
-      return;
+  Future<void> _hydrateOnlineDrivers() async {
+    final rows = await _client
+        .from('profiles')
+        .select()
+        .eq('role', 'driver')
+        .eq('is_online_driver', true);
+    _onlineDrivers.clear();
+    for (final row in rows) {
+      _onlineDrivers[row['id'] as String] = AppUser(
+        id: row['id'] as String,
+        email: row['email'] as String? ?? '',
+        name: row['name'] as String? ?? '',
+        role: UserRole.driver,
+        vesselName: row['vessel_name'] as String?,
+        vesselCapacity: row['vessel_capacity'] as int?,
+      );
     }
-    final aIdx = _active.indexWhere((r) => r.id == rideId);
-    if (aIdx != -1) {
-      final ride = _active.removeAt(aIdx);
-      ride.status = RideStatus.cancelled;
-      ride.cancelledByUserId = byUserId;
-      ride.completedAt = DateTime.now();
-      _history.insert(0, ride);
-      _persistHistory();
-      notifyListeners();
-    }
+    notifyListeners();
   }
 
-  // ─── internals ──────────────────────────────────────────────────────
+  // ─── helpers ────────────────────────────────────────────────────────
 
-  Ride _findActive(String rideId) {
-    for (final r in _active) {
-      if (r.id == rideId) return r;
-    }
-    throw const RideException('Ride is not active.');
+  Ride _rideFromRow(Map<String, dynamic> row) {
+    return Ride(
+      id: row['id'] as String,
+      passengerId: row['passenger_id'] as String,
+      passengerName: row['passenger_name'] as String? ?? 'Passenger',
+      driverId: row['driver_id'] as String?,
+      driverName: row['driver_name'] as String?,
+      vesselName: row['vessel_name'] as String?,
+      pickup: LatLng(
+        (row['pickup_lat'] as num).toDouble(),
+        (row['pickup_lng'] as num).toDouble(),
+      ),
+      pickupLabel: row['pickup_label'] as String,
+      dropoff: LatLng(
+        (row['dropoff_lat'] as num).toDouble(),
+        (row['dropoff_lng'] as num).toDouble(),
+      ),
+      dropoffLabel: row['dropoff_label'] as String,
+      distanceKm: (row['distance_km'] as num).toDouble(),
+      etaMinutes: (row['eta_minutes'] as num).toInt(),
+      fareEur: (row['fare_eur'] as num).toDouble(),
+      status: RideStatus.values.firstWhere(
+        (s) => s.name == row['status'],
+        orElse: () => RideStatus.requested,
+      ),
+      createdAt: DateTime.parse(row['created_at'] as String),
+      completedAt: row['completed_at'] == null
+          ? null
+          : DateTime.parse(row['completed_at'] as String),
+      cancelledByUserId: row['cancelled_by_user_id'] as String?,
+    );
   }
 
-  bool _isValidTransition(RideStatus from, RideStatus to) {
-    const map = <RideStatus, Set<RideStatus>>{
-      RideStatus.accepted: {RideStatus.driverEnRoute, RideStatus.cancelled},
-      RideStatus.driverEnRoute: {
-        RideStatus.arrivedAtPickup,
-        RideStatus.cancelled,
-      },
-      RideStatus.arrivedAtPickup: {
-        RideStatus.inProgress,
-        RideStatus.cancelled,
-      },
-      RideStatus.inProgress: {RideStatus.completed},
-    };
-    return map[from]?.contains(to) ?? false;
-  }
-
-  void _restoreHistory() {
-    final raw = _prefs.getString(_kHistory);
-    if (raw == null || raw.isEmpty) return;
-    try {
-      _history.addAll(Ride.decodeList(raw));
-    } catch (_) {
-      // Ignore corrupt history; start fresh.
-    }
-  }
-
-  Future<void> _persistHistory() async {
-    // Cap stored history at 100 rides to keep prefs small.
-    final capped = _history.take(100).toList();
-    await _prefs.setString(_kHistory, Ride.encodeList(capped));
+  @override
+  void dispose() {
+    _auth.removeListener(_onAuthChanged);
+    _disconnect();
+    super.dispose();
   }
 }
 

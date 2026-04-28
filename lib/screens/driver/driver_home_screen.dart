@@ -118,16 +118,19 @@ class DriverHomeScreen extends StatelessWidget {
     );
   }
 
-  void _accept(BuildContext context, Ride ride) {
+  Future<void> _accept(BuildContext context, Ride ride) async {
     final user = Session.require(context);
     try {
-      final accepted = context.read<RideService>().acceptRide(ride.id, user);
+      final accepted =
+          await context.read<RideService>().acceptRide(ride.id, user);
+      if (!context.mounted) return;
       Navigator.of(context).push(
         MaterialPageRoute<void>(
           builder: (_) => DriverTripScreen(rideId: accepted.id),
         ),
       );
     } on RideException catch (e) {
+      if (!context.mounted) return;
       ScaffoldMessenger.of(context)
           .showSnackBar(SnackBar(content: Text(e.message)));
     }

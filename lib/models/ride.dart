@@ -36,6 +36,24 @@ extension RideStatusX on RideStatus {
       this == RideStatus.completed || this == RideStatus.cancelled;
 }
 
+/// Allowed ride state transitions. Kept here as a pure function so tests
+/// can exercise it without hitting the database.
+bool isValidRideTransition(RideStatus from, RideStatus to) {
+  const map = <RideStatus, Set<RideStatus>>{
+    RideStatus.accepted: {RideStatus.driverEnRoute, RideStatus.cancelled},
+    RideStatus.driverEnRoute: {
+      RideStatus.arrivedAtPickup,
+      RideStatus.cancelled,
+    },
+    RideStatus.arrivedAtPickup: {
+      RideStatus.inProgress,
+      RideStatus.cancelled,
+    },
+    RideStatus.inProgress: {RideStatus.completed},
+  };
+  return map[from]?.contains(to) ?? false;
+}
+
 class Ride {
   Ride({
     required this.id,

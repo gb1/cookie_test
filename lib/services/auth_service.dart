@@ -1,58 +1,78 @@
-import 'dart:convert';
+import 'dart:async';
 
 import 'package:flutter/foundation.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:uuid/uuid.dart';
+import 'package:supabase_flutter/supabase_flutter.dart' hide AuthException;
+import 'package:supabase_flutter/supabase_flutter.dart' as sb show AuthApiException;
 
 import '../models/app_user.dart';
 
-/// Mock authentication. Stores users in `shared_preferences` keyed by email.
-/// Passwords are stored as-is for the demo only - this is not secure and is
-/// not how a real auth flow should work.
+/// Auth backed by Supabase. The user's app-level profile (display name,
+/// role, vessel info) lives in the `public.profiles` table; we hydrate it
+/// after every auth change.
 class AuthService extends ChangeNotifier {
-  AuthService(this._prefs) {
-    _restore();
+  AuthService(this._client) {
+    _authSub = _client.auth.onAuthStateChange.listen((event) {
+      final session = event.session;
+      if (session == null) {
+        _setUser(null);
+      } else {
+        _hydrate(session.user.id);
+      }
+    });
+
+    final existing = _client.auth.currentSession;
+    if (existing != null) {
+      _hydrate(existing.user.id);
+    }
   }
 
-  static const _kCurrentUser = 'auth.currentUser';
-  static const _kUsers = 'auth.users';
-  static const _kPasswords = 'auth.passwords';
-
-  final SharedPreferences _prefs;
-  final _uuid = const Uuid();
+  final SupabaseClient _client;
+  late final StreamSubscription<AuthState> _authSub;
 
   AppUser? _currentUser;
   AppUser? get currentUser => _currentUser;
   bool get isSignedIn => _currentUser != null;
 
-  void _restore() {
-    final raw = _prefs.getString(_kCurrentUser);
-    if (raw != null && raw.isNotEmpty) {
-      _currentUser = AppUser.decode(raw);
+  Future<void> _hydrate(String userId) async {
+    try {
+      final row = await _client
+          .from('profiles')
+          .select()
+          .eq('id', userId)
+          .maybeSingle();
+      if (row == null) {
+        // Trigger usually creates this row; fall back to auth metadata.
+        final auth = _client.auth.currentUser;
+        if (auth == null) return;
+        _setUser(AppUser(
+          id: auth.id,
+          email: auth.email ?? '',
+          name: auth.userMetadata?['name'] as String? ??
+              (auth.email?.split('@').first ?? 'User'),
+          role: UserRole.passenger,
+        ));
+        return;
+      }
+      _setUser(_userFromRow(row));
+    } catch (_) {
+      // Network blip - leave the existing user in place.
     }
   }
 
-  Map<String, AppUser> _allUsers() {
-    final raw = _prefs.getString(_kUsers);
-    if (raw == null || raw.isEmpty) return <String, AppUser>{};
-    final m = jsonDecode(raw) as Map<String, dynamic>;
-    return m.map((k, v) =>
-        MapEntry(k, AppUser.fromJson(v as Map<String, dynamic>)));
+  AppUser _userFromRow(Map<String, dynamic> row) {
+    return AppUser(
+      id: row['id'] as String,
+      email: row['email'] as String? ?? '',
+      name: row['name'] as String? ?? '',
+      role: row['role'] == 'driver' ? UserRole.driver : UserRole.passenger,
+      vesselName: row['vessel_name'] as String?,
+      vesselCapacity: row['vessel_capacity'] as int?,
+    );
   }
 
-  Future<void> _saveUsers(Map<String, AppUser> users) async {
-    final json = users.map((k, v) => MapEntry(k, v.toJson()));
-    await _prefs.setString(_kUsers, jsonEncode(json));
-  }
-
-  Map<String, String> _allPasswords() {
-    final raw = _prefs.getString(_kPasswords);
-    if (raw == null || raw.isEmpty) return <String, String>{};
-    return Map<String, String>.from(jsonDecode(raw) as Map);
-  }
-
-  Future<void> _savePasswords(Map<String, String> pw) async {
-    await _prefs.setString(_kPasswords, jsonEncode(pw));
+  void _setUser(AppUser? user) {
+    _currentUser = user;
+    notifyListeners();
   }
 
   Future<AppUser> signUp({
@@ -60,44 +80,59 @@ class AuthService extends ChangeNotifier {
     required String password,
     required String name,
   }) async {
-    final users = _allUsers();
-    final key = email.trim().toLowerCase();
-    if (users.containsKey(key)) {
-      throw const AuthException('An account with that email already exists.');
+    try {
+      final res = await _client.auth.signUp(
+        email: email.trim(),
+        password: password,
+        data: {'name': name.trim()},
+      );
+      final user = res.user;
+      if (user == null) {
+        throw const AuthException('Sign-up did not return a user.');
+      }
+      // The DB trigger creates the profile row; hydrate to pick it up.
+      await _hydrate(user.id);
+      return _currentUser ??
+          AppUser(
+            id: user.id,
+            email: email.trim(),
+            name: name.trim(),
+            role: UserRole.passenger,
+          );
+    } on sb.AuthApiException catch (e) {
+      throw AuthException(e.message);
     }
-    final user = AppUser(
-      id: _uuid.v4(),
-      email: key,
-      name: name.trim(),
-      role: UserRole.passenger,
-    );
-    users[key] = user;
-    final pws = _allPasswords()..[key] = password;
-    await _saveUsers(users);
-    await _savePasswords(pws);
-    await _setCurrent(user);
-    return user;
   }
 
   Future<AppUser> signIn({
     required String email,
     required String password,
   }) async {
-    final key = email.trim().toLowerCase();
-    final users = _allUsers();
-    final pws = _allPasswords();
-    final user = users[key];
-    if (user == null || pws[key] != password) {
-      throw const AuthException('Invalid email or password.');
+    try {
+      final res = await _client.auth.signInWithPassword(
+        email: email.trim(),
+        password: password,
+      );
+      final user = res.user;
+      if (user == null) {
+        throw const AuthException('Invalid email or password.');
+      }
+      await _hydrate(user.id);
+      return _currentUser ??
+          AppUser(
+            id: user.id,
+            email: email.trim(),
+            name: email.split('@').first,
+            role: UserRole.passenger,
+          );
+    } on sb.AuthApiException catch (e) {
+      throw AuthException(e.message);
     }
-    await _setCurrent(user);
-    return user;
   }
 
   Future<void> signOut() async {
-    _currentUser = null;
-    await _prefs.remove(_kCurrentUser);
-    notifyListeners();
+    await _client.auth.signOut();
+    _setUser(null);
   }
 
   Future<void> updateProfile({
@@ -108,21 +143,24 @@ class AuthService extends ChangeNotifier {
   }) async {
     final user = _currentUser;
     if (user == null) return;
-    final updated = user.copyWith(
-      name: name,
-      role: role,
-      vesselName: vesselName,
-      vesselCapacity: vesselCapacity,
-    );
-    final users = _allUsers()..[user.email] = updated;
-    await _saveUsers(users);
-    await _setCurrent(updated);
+
+    final patch = <String, dynamic>{
+      if (name != null) 'name': name.trim(),
+      if (role != null) 'role': role.name,
+      if (vesselName != null) 'vessel_name': vesselName.trim(),
+      if (vesselCapacity != null) 'vessel_capacity': vesselCapacity,
+      'updated_at': DateTime.now().toUtc().toIso8601String(),
+    };
+    if (patch.length == 1) return; // only updated_at
+
+    await _client.from('profiles').update(patch).eq('id', user.id);
+    await _hydrate(user.id);
   }
 
-  Future<void> _setCurrent(AppUser user) async {
-    _currentUser = user;
-    await _prefs.setString(_kCurrentUser, user.encode());
-    notifyListeners();
+  @override
+  void dispose() {
+    _authSub.cancel();
+    super.dispose();
   }
 }
 
@@ -132,3 +170,4 @@ class AuthException implements Exception {
   @override
   String toString() => message;
 }
+
