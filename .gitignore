@@ -40,3 +40,6 @@ ios/Pods/
 # Misc
 .DS_Store
 *.log
+
+# Netlify CLI
+.netlify/
